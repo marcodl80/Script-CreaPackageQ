@@ -683,51 +683,7 @@ def _getsql_has_searchparam_in_signature(text: str, table_upper: str) -> bool:
     return "P_SEARCHPARAM" in param_names
 
 
-def _strip_filter_order_scope_from_getsql_signature(text: str, table_upper: str) -> tuple[str, bool]:
-    """
-    Se nella firma di GetSql<TABLE> ci sono sia p_SearchParam che p_Filter/p_OrderByCond/p_ScopeName,
-    elimina questi ultimi tre parametri dalla firma (non li rinomina).
-    """
-    func_name = f"GETSQL{table_upper}"
-    open_idx = _find_signature_paren_index(text, "FUNCTION", func_name)
-    if open_idx < 0:
-        return text, False
-    span = _find_matching_paren_span(text, open_idx)
-    if not span:
-        return text, False
-
-    inside = text[span[0] + 1:span[1]]
-    params = _split_params(inside)
-    if not params:
-        return text, False
-
-    names = [(_param_name(p) or "").upper() for p in params]
-    if "P_SEARCHPARAM" not in names:
-        # regola speciale solo quando c'è già p_SearchParam
-        return text, False
-
-    to_remove = {"P_FILTER", "P_ORDERBYCOND", "P_SCOPENAME"}
-    new_params = [p for p in params if (_param_name(p) or "").upper() not in to_remove]
-
-    if len(new_params) == len(params):
-        return text, False
-
-    indent = "  "
-    for line in inside.splitlines():
-        if line.strip():
-            indent = re.match(r"^\s*", line).group(0)
-            break
-    new_inside = _format_param_list(new_params, indent)
-    out = text[: span[0] + 1] + new_inside + text[span[1] :]
-    return out, (out != text)
-
-
 def _patch_lsresync_replace_filter_order_scope_inside_getsql(resync_text: str, table_upper: str) -> tuple[str, bool]:
-    """
-    Nel body di GetSql<TABLE> sostituisce p_Filter/p_OrderByCond/p_ScopeName
-    con p_SearchParam.pFilter/p_SearchParam.pOrderByCond/p_SearchParam.pScopeName,
-    ma solo se in firma esiste già p_SearchParam.
-    """
     func_name = f"GETSQL{table_upper}"
 
     if not _getsql_has_searchparam_in_signature(resync_text, table_upper):
@@ -1371,142 +1327,6 @@ def _patch_ls_pkb_getsql_calls_for_table(content: str, table: str) -> tuple[str,
 
 
 # ------------------------------------------------------------------------------------
-# Fix chiamate GetSql in GETRECORD/GETROW (incluso p_ME_*)
-# ------------------------------------------------------------------------------------
-def _ls_getrecord_getrow_expected_call_args(
-    table_upper: str,
-    method_upper: str,
-    me_param_names: list[str],
-) -> list[str]:
-    """
-    Restituisce la lista di argomenti attesa per la chiamata
-    LSRESYNC<table>_Q.GetSql<table> nel body di:
-      - GETRECORD<table>
-      - GETROW<table>
-
-    Inserisce i parametri p_ME_* (me_param_names) dopo p_Context,
-    mantenendo l'ordine originale della signature.
-    """
-    base_prefix = [
-        "p_CodCompany",
-        "p_Bo_SessionID",
-        "p_Context",
-    ]
-    # ME params in ordine così come appaiono in firma
-    me_part = me_param_names[:]
-
-    if method_upper == f"GETRECORD{table_upper}":
-        tail = [
-            "SiwFunc.c_GetRecord",
-            "v_SearchParam",
-            "0",
-        ]
-        return base_prefix + me_part + tail
-
-    if method_upper == f"GETROW{table_upper}":
-        tail = [
-            "SiwFunc.c_Row",
-            "v_SearchParam",
-            "p_WithActionInfo",
-            "p_InvokeFromWR",
-        ]
-        return base_prefix + me_part + tail
-
-    return []
-
-
-def _normalize_arg(a: str) -> str:
-    """Normalizza un argomento per confronto (spazi, maiuscole)."""
-    return re.sub(r"\s+", "", a).upper()
-
-
-def _ls_collect_me_params_from_signature(mb: str, method_upper: str) -> list[str]:
-    """
-    Dato il body di un metodo e il suo nome (GETRECORD<table>/GETROW<table>),
-    estrae i nomi dei parametri di firma che iniziano con p_ME_ nell'ordine
-    in cui compaiono.
-    """
-    hdr = _find_method_header_pos(mb, "FUNCTION", method_upper)
-    if not hdr:
-        return []
-    open_idx = mb.find("(", hdr.end())
-    if open_idx < 0:
-        return []
-    span = _find_matching_paren_span(mb, open_idx)
-    if not span:
-        return []
-    inside = mb[span[0] + 1:span[1]]
-    params = _split_params(inside)
-    me_names: list[str] = []
-    for p in params:
-        n = _param_name(p) or ""
-        if n.upper().startswith("P_ME_"):
-            # prendo la forma testuale come appare nella firma (prima parola)
-            mm = re.match(r"(?is)^\s*([A-Z0-9_#$]+)", p.strip())
-            if mm:
-                me_names.append(mm.group(1))
-    return me_names
-
-
-def _patch_ls_getrecord_getrow_getsql_call(content: str, table: str) -> tuple[str, bool]:
-    """
-    In GETRECORD<table> e GETROW<table> di un package LS*_Q.pkb:
-      - trova la chiamata LSRESYNC<table>_Q.GetSql<table>
-      - riscrive la lista argomenti con il pattern atteso (che usa v_SearchParam e,
-        se presenti in firma, i parametri p_ME_* subito dopo p_Context).
-    Gestisce argomenti su più righe, spazi vari, NULL, ecc.
-    """
-    table_upper = table.upper()
-    changed_any = False
-    out = content
-
-    for method_upper in (f"GETRECORD{table_upper}", f"GETROW{table_upper}"):
-        mb = extract_method_block_body(out, "FUNCTION", method_upper)
-        if not mb:
-            continue
-
-        me_params = _ls_collect_me_params_from_signature(mb, method_upper)
-        expected_args = _ls_getrecord_getrow_expected_call_args(table_upper, method_upper, me_params)
-        if not expected_args:
-            continue
-
-        call_rx = re.compile(
-            rf"(?is)(LSRESYNC{re.escape(table_upper)}_Q\s*\.\s*GetSql{re.escape(table_upper)}\s*\()"
-        )
-        cm = call_rx.search(mb)
-        if not cm:
-            continue
-
-        open_idx = cm.end() - 1
-        span = _find_matching_paren_span(mb, open_idx)
-        if not span:
-            continue
-
-        inside = mb[span[0] + 1:span[1]]
-        args = _split_params(inside)
-
-        norm_args = [_normalize_arg(a) for a in args]
-        norm_expected = [_normalize_arg(a) for a in expected_args]
-        if norm_args == norm_expected:
-            continue
-
-        indent = "      "
-        rebuilt_lines = [f"{indent}{a}," for a in expected_args[:-1]] + [
-            f"{indent}{expected_args[-1]}"
-        ]
-        rebuilt = "\n" + "\n".join(rebuilt_lines) + "\n"
-
-        mb2 = mb[: span[0] + 1] + rebuilt + mb[span[1] :]
-        if mb2 == mb:
-            continue
-
-        out = out.replace(mb, mb2)
-        changed_any = True
-
-    return out, changed_any
-
-
-# ------------------------------------------------------------------------------------
 # Template merge
 # ------------------------------------------------------------------------------------
 _RESYNC_TABLE_NUMFIELDS: dict[str, int] = {}
@@ -1765,44 +1585,27 @@ def main():
 
             getsql_tables = _iter_getsql_table_suffixes_in_text(resync_text)
 
-            # PKS o PKB: patch delle firme per GetSql<...> (solo se in SEARCHOBJECTS)
             for t in getsql_tables:
-                resync_text2, ch = _patch_lsresync_one_getsql_signature_using_template(
-                    resync_text, t, template_tail
-                )
+                resync_text2, ch = _patch_lsresync_one_getsql_signature_using_template(resync_text, t, template_tail)
                 if ch:
                     changed_any = True
                     resync_text = resync_text2
 
-                # nuova regola: se coesistono p_SearchParam + p_Filter/p_OrderByCond/p_ScopeName
-                # elimino questi ultimi dalla firma sia su pks che su pkb
-                resync_text2, ch2 = _strip_filter_order_scope_from_getsql_signature(resync_text, t)
-                if ch2:
-                    changed_any = True
-                    resync_text = resync_text2
-
             if out_path.suffix.lower() == ".pkb":
-                # sostituzione nel body di GetSql* (solo se è presente p_SearchParam in firma)
                 for t in getsql_tables:
-                    resync_text2, ch = _patch_lsresync_replace_filter_order_scope_inside_getsql(
-                        resync_text, t
-                    )
+                    resync_text2, ch = _patch_lsresync_replace_filter_order_scope_inside_getsql(resync_text, t)
                     if ch:
                         changed_any = True
                         resync_text = resync_text2
 
-                # iniezione AddCond solo per tabelle presenti in SEARCHOBJECTS
                 for t in getsql_tables:
                     resync_text2, ch = _patch_lsresync_inject_addcond_inside_getsql(resync_text, t)
                     if ch:
                         changed_any = True
                         resync_text = resync_text2
 
-                # patch LsScopes.GetWhereCondByScopeNames con p_SearchParam.pScopeName
                 for t in getsql_tables:
-                    resync_text2, ch = _patch_lsresync_scopes_call_inside_getsql_if_allowed(
-                        resync_text, t
-                    )
+                    resync_text2, ch = _patch_lsresync_scopes_call_inside_getsql_if_allowed(resync_text, t)
                     if ch:
                         changed_any = True
                         resync_text = resync_text2
@@ -1810,14 +1613,13 @@ def main():
             if changed_any:
                 write_text(out_path, resync_text, resync_enc)
 
-        # LS pkb patch: GetList/GetRecord/GetRow + fix chiamate GetSql in GetRecord/GetRow (con p_ME_*)
+        # LS pkb patch: GetList/GetRecord/GetRow
         if prefix.upper() == "LS" and out_path.suffix.lower() == ".pkb":
             if nometabella.upper() in _RESYNC_TABLES_WITH_SEARCHPARAM:
                 ls_text, ls_enc = read_text_best_effort(out_path)
-                ls_text2, ch1 = _patch_ls_pkb_getsql_calls_for_table(ls_text, nometabella)
-                ls_text3, ch2 = _patch_ls_getrecord_getrow_getsql_call(ls_text2, nometabella)
-                if ch1 or ch2:
-                    write_text(out_path, ls_text3, ls_enc)
+                ls_text2, ch = _patch_ls_pkb_getsql_calls_for_table(ls_text, nometabella)
+                if ch:
+                    write_text(out_path, ls_text2, ls_enc)
 
         # CROSS injection based on LSRESYNC GetSql signature
         if nometabella.upper() in _RESYNC_TABLES_WITH_SEARCHPARAM:
@@ -1861,7 +1663,7 @@ def main():
                         if ch_sig or ch_call:
                             write_text(out_path, t3, e)
 
-        # LsW: patch LS_SEARCH in base a SEARCHOBJECTS (e opzionalmente LSRESYNC)
+        # LsW: patch LS_SEARCH indipendente da LSRESYNC (solo in base a SEARCHOBJECTS)
         if prefix.upper() == "LSW":
             has_search = _table_has_searchobjects(nometabella.upper())
 
@@ -1877,6 +1679,7 @@ def main():
                     )
                     ch_any = ch_any or ch_sig
 
+                # se esiste anche il LSRESYNC per questa tabella, in _RESYNC_TABLES_WITH_SEARCHPARAM
                 if nometabella.upper() in _RESYNC_TABLES_WITH_SEARCHPARAM:
                     me_params = _RESYNC_TABLE_ME_PARAMS.get(nometabella.upper(), [])
                     if me_params:
@@ -1895,21 +1698,25 @@ def main():
                 ch_any = False
 
                 if has_search:
+                    # firma in header LS_SEARCH
                     t2, ch_sig = _patch_lsw_ls_search_signature_add_fields_from_searchparam(
                         t2, nometabella.upper()
                     )
                     ch_any = ch_any or ch_sig
 
+                    # costruttore NULL per v_SearchParam
                     t2, cnt_ctor = patch_lsw_pkb_searchparam_constructor_null_list(
                         t2, nometabella.upper()
                     )
                     ch_any = ch_any or bool(cnt_ctor)
 
+                    # assegnamenti v_SearchParam.CAMPO := CAMPO;
                     t2, ch_assign = _patch_lsw_pkb_searchparam_assignments(
                         t2, nometabella.upper()
                     )
                     ch_any = ch_any or ch_assign
 
+                # se esiste LSRESYNC con p_ME_ per questa tabella, aggiungi me_params e update call
                 if nometabella.upper() in _RESYNC_TABLES_WITH_SEARCHPARAM:
                     me_params = _RESYNC_TABLE_ME_PARAMS.get(nometabella.upper(), [])
                     if me_params:
