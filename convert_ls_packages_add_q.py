@@ -1002,8 +1002,6 @@ def _inject_me_params_into_ls_search_call_after_searchparam_anykind(
         return text, False
 
     idx_sp = _find_searchparam_arg_index(args)
-    if idx_sp is None:
-        return text, False
 
     me_arg_names: list[str] = []
     for p in me_params:
@@ -1011,12 +1009,40 @@ def _inject_me_params_into_ls_search_call_after_searchparam_anykind(
         if mm:
             me_arg_names.append(mm.group(1))
 
-    existing_upper = {a.strip().upper() for a in args}
-    to_add = [a for a in me_arg_names if a.upper() not in existing_upper]
-    if not to_add:
-        return text, False
+    _OLD_STYLE_REMOVE = {"P_FILTER", "P_ORDERBYCOND", "P_SCOPENAME"}
+    has_old_style = any(a.strip().upper() in _OLD_STYLE_REMOVE for a in args)
 
-    new_args = args[: idx_sp + 1] + to_add + args[idx_sp + 1:]
+    if idx_sp is None and has_old_style:
+        # Old-style call (uses p_Filter/p_OrderByCond/p_ScopeName instead of p_SearchParam):
+        # remove the old filter params and insert p_SearchParam right after p_Context.
+        args_filtered = [a for a in args if a.strip().upper() not in _OLD_STYLE_REMOVE]
+        idx_ctx = next(
+            (i for i, a in enumerate(args_filtered) if a.strip().upper() == "P_CONTEXT"), None
+        )
+        if idx_ctx is None:
+            return text, False
+        new_args = args_filtered[: idx_ctx + 1] + ["p_SearchParam"] + args_filtered[idx_ctx + 1:]
+        # If any me_params are not yet present, insert them after p_SearchParam.
+        existing_args_upper = {a.strip().upper() for a in new_args}
+        to_add_me = [a for a in me_arg_names if a.upper() not in existing_args_upper]
+        if to_add_me:
+            idx_searchparam_converted = _find_searchparam_arg_index(new_args)
+            if idx_searchparam_converted is not None:
+                new_args = new_args[: idx_searchparam_converted + 1] + to_add_me + new_args[idx_searchparam_converted + 1:]
+            else:
+                new_args = new_args + to_add_me
+    elif idx_sp is None:
+        return text, False
+    else:
+        # New-style call: p_SearchParam already present; add any missing me_params after it.
+        existing_upper = {a.strip().upper() for a in args}
+        to_add = [a for a in me_arg_names if a.upper() not in existing_upper]
+        if not to_add:
+            return text, False
+        new_args = args[: idx_sp + 1] + to_add + args[idx_sp + 1:]
+
+    if [a.strip() for a in new_args] == [a.strip() for a in args]:
+        return text, False
 
     rebuilt_lines = [f"      {a}," for a in new_args[:-1]] + [f"      {new_args[-1]}"]
     rebuilt = "\n" + "\n".join(rebuilt_lines) + "\n"
@@ -1065,22 +1091,47 @@ def _inject_me_params_into_ls_search_call_getsql_lsresync(text: str, table_upper
 
     idx_context = next((i for i, a in enumerate(args) if a.strip().upper() == "P_CONTEXT"), None)
     idx_searchparam = next((i for i, a in enumerate(args) if a.strip().upper() == "P_SEARCHPARAM"), None)
-    if idx_context is None or idx_context + 1 >= len(args) or idx_searchparam is None:
+
+    if idx_context is None:
         return text, False
 
-    tipo_sql_arg = args[idx_context + 1]
+    _OLD_STYLE_REMOVE = {"P_FILTER", "P_ORDERBYCOND", "P_SCOPENAME"}
+    has_old_style = any(a.strip().upper() in _OLD_STYLE_REMOVE for a in args)
 
-    me_in_sig_order: list[str] = []
-    for pname in sig_order:
-        if pname.startswith("P_ME_") and pname in me_set_upper:
-            ix = me_arg_names_upper.index(pname)
-            me_in_sig_order.append(me_arg_names[ix])
+    if idx_searchparam is None and has_old_style:
+        # Old-style call: the body passes p_Filter/p_OrderByCond/p_ScopeName to GetSql
+        # but the generated LsResync*_Q.GetSql* now requires p_SearchParam.
+        # Convert by removing the old filter params and inserting p_SearchParam after
+        # p_Context; keep me_params (already present from original) in their positions.
+        args_filtered = [a for a in args if a.strip().upper() not in _OLD_STYLE_REMOVE]
+        idx_ctx_f = next(
+            (i for i, a in enumerate(args_filtered) if a.strip().upper() == "P_CONTEXT"), None
+        )
+        if idx_ctx_f is None:
+            return text, False
+        new_args = args_filtered[: idx_ctx_f + 1] + ["p_SearchParam"] + args_filtered[idx_ctx_f + 1:]
 
-    prefix = args[: idx_context + 1]
-    tail = args[idx_searchparam:]
-    tail_filtered = [a for a in tail if a.strip().upper() not in me_set_upper]
+    elif idx_searchparam is None:
+        return text, False
 
-    new_args = prefix + me_in_sig_order + [tipo_sql_arg] + tail_filtered
+    else:
+        # New-style call: p_SearchParam is already present; rearrange me_params.
+        if idx_context + 1 >= len(args):
+            return text, False
+
+        tipo_sql_arg = args[idx_context + 1]
+
+        me_in_sig_order: list[str] = []
+        for pname in sig_order:
+            if pname.startswith("P_ME_") and pname in me_set_upper:
+                ix = me_arg_names_upper.index(pname)
+                me_in_sig_order.append(me_arg_names[ix])
+
+        prefix = args[: idx_context + 1]
+        tail = args[idx_searchparam:]
+        tail_filtered = [a for a in tail if a.strip().upper() not in me_set_upper]
+
+        new_args = prefix + me_in_sig_order + [tipo_sql_arg] + tail_filtered
 
     if [a.strip() for a in new_args] == [a.strip() for a in args]:
         return text, False
