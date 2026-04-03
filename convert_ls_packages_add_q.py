@@ -959,6 +959,69 @@ def _inject_me_params_after_anchor_in_signature_anykind(
     return out, (out != text)
 
 
+def _inject_me_params_into_getrow_getrecord_getlist_signatures(
+    text: str,
+    table_upper: str,
+    me_params: list[str],
+    kind: str = "FUNCTION",
+) -> tuple[str, bool]:
+    """Insert p_ME_* params (after p_Context) into GetRow*, GetList*, GetRecord* signatures.
+
+    This mirrors what the _Q GetSql signature requires: the callers must declare the same
+    p_ME_* parameters so they can be forwarded to GetSql.
+    """
+    changed = False
+    for method_name in (
+        f"GETROW{table_upper}",
+        f"GETLIST{table_upper}",
+        f"GETRECORD{table_upper}",
+    ):
+        hdr = _find_method_header_pos(text, kind, method_name)
+        if not hdr:
+            continue
+
+        open_idx = text.find("(", hdr.end())
+        if open_idx < 0:
+            continue
+
+        span = _find_matching_paren_span(text, open_idx)
+        if not span:
+            continue
+
+        inside = text[span[0] + 1 : span[1]]
+        params = _split_params(inside)
+        if not params:
+            continue
+
+        # Anchor: inject after p_Context.
+        idx_anchor = next(
+            (i for i, p in enumerate(params) if (_param_name(p) or "").upper() == "P_CONTEXT"),
+            None,
+        )
+        if idx_anchor is None:
+            continue
+
+        existing = {(_param_name(p) or "").upper() for p in params}
+        to_add = [mp.strip() for mp in me_params
+                  if (name := (_param_name(mp) or "")) and name.upper() not in existing]
+        if not to_add:
+            continue
+
+        new_params = params[: idx_anchor + 1] + to_add + params[idx_anchor + 1 :]
+
+        indent = "  "
+        for line in inside.splitlines():
+            if line.strip():
+                indent = re.match(r"^\s*", line).group(0)
+                break
+
+        new_inside = _format_param_list(new_params, indent)
+        text = text[: span[0] + 1] + new_inside + text[span[1] :]
+        changed = True
+
+    return text, changed
+
+
 def _find_searchparam_arg_index(args: list[str]) -> int | None:
     for i, a in enumerate(args):
         s = a.strip()
@@ -1311,6 +1374,85 @@ def _ls_call_tail_rule_for_method(method_upper: str, table_upper: str) -> tuple[
     )
 
 
+def _rebuild_getsql_args_signature_based(
+    args: list[str],
+    sig_order: list[str],
+    me_params: list[str],
+) -> list[str] | None:
+    """Rebuild GetSql call args to align with the *_Q signature.
+
+    For each parameter positionally up to and including P_SEARCHPARAM:
+      - If the signature slot is a p_ME_* name and the call passes NULL, replace with the
+        actual parameter name.
+      - If the signature slot is P_SEARCHPARAM and the call passes NULL (or P_SEARCHPARAM),
+        replace with v_SearchParam.
+
+    Arguments after P_SEARCHPARAM that correspond to the now-removed filter params
+    (p_Filter, NULL for p_OrderByCond, p_ScopeName) are dropped; all others are kept.
+
+    Returns None when the transformation cannot be applied (e.g. signature has no
+    P_SEARCHPARAM or the call is too short for the prefix to be matched).
+    """
+    if not sig_order:
+        return None
+
+    try:
+        idx_sp_sig = sig_order.index("P_SEARCHPARAM")
+    except ValueError:
+        return None
+
+    # The call must supply at least the prefix positions (0..idx_sp_sig).
+    if len(args) <= idx_sp_sig:
+        return None
+
+    # Sanity-check: the arg at the P_SEARCHPARAM slot must look like a SearchParam
+    # (NULL / P_SEARCHPARAM / V_SEARCHPARAM) for the positional mapping to be valid.
+    # If something else is there (e.g. P_WITHACTIONINFO), the old signature did not have
+    # p_SearchParam at this position and the positional mapping does not apply.
+    sp_slot_upper = args[idx_sp_sig].strip().upper()
+    if sp_slot_upper not in ("NULL", "P_SEARCHPARAM", "V_SEARCHPARAM"):
+        return None
+
+    # Build a lookup from uppercase ME param name to the original-case argument name.
+    me_name_map: dict[str, str] = {}
+    for mp in me_params:
+        # Use the raw param text to preserve original capitalization (p_ME_Xxx, not P_ME_XXX).
+        s = _clean_param_for_compare(mp)
+        m_name = re.match(r"(?s)^\s*([A-Za-z0-9_#$]+)\b", s)
+        if m_name:
+            original = m_name.group(1)
+            me_name_map[original.upper()] = original
+
+    # Process prefix args (positions 0 .. idx_sp_sig inclusive).
+    prefix_args = list(args[: idx_sp_sig + 1])
+    for i, sig_name in enumerate(sig_order[: idx_sp_sig + 1]):
+        if i >= len(prefix_args):
+            break
+        a_upper = prefix_args[i].strip().upper()
+        if sig_name in me_name_map and a_upper == "NULL":
+            prefix_args[i] = me_name_map[sig_name]
+        elif sig_name == "P_SEARCHPARAM" and a_upper in ("NULL", "P_SEARCHPARAM"):
+            prefix_args[i] = "v_SearchParam"
+
+    # Process suffix args (everything after the P_SEARCHPARAM slot).
+    _REMOVE_UPPER = {"P_FILTER", "P_ORDERBYCOND", "P_SCOPENAME"}
+    suffix_raw = args[idx_sp_sig + 1:]
+    suffix_new: list[str] = []
+    for i, a in enumerate(suffix_raw):
+        a_upper = a.strip().upper()
+        if a_upper in _REMOVE_UPPER:
+            continue
+        # A lone NULL between p_Filter and p_ScopeName is the old p_OrderByCond.
+        if a_upper == "NULL":
+            prev_upper = suffix_raw[i - 1].strip().upper() if i > 0 else ""
+            next_upper = suffix_raw[i + 1].strip().upper() if i + 1 < len(suffix_raw) else ""
+            if prev_upper == "P_FILTER" or next_upper == "P_SCOPENAME":
+                continue
+        suffix_new.append(a)
+
+    return prefix_args + suffix_new
+
+
 def _patch_ls_method_body_for_searchparam_call(content: str, table: str, method_upper: str) -> tuple[str, bool]:
     mb = extract_method_block_body(content, "FUNCTION", method_upper)
     if not mb:
@@ -1349,17 +1491,36 @@ def _patch_ls_method_body_for_searchparam_call(content: str, table: str, method_
         if span:
             inside = out_mb[span[0] + 1:span[1]]
             args = _split_params(inside)
-            if len(args) >= 4:
-                tail = [a.strip().upper() for a in args[-4:]]
+
+            new_args = None
+
+            # Preferred: signature-based approach using the known _Q GetSql param order.
+            sig_order = _RESYNC_TABLE_GETSQL_PARAM_ORDER.get(table_upper, [])
+            me_params_list = _RESYNC_TABLE_ME_PARAMS.get(table_upper, [])
+            if sig_order:
+                new_args = _rebuild_getsql_args_signature_based(args, sig_order, me_params_list)
+
+            # Fallback: "last-N args" heuristic (original approach).
+            if new_args is None and len(args) >= 4:
                 expected_last4, replacement_tail = _ls_call_tail_rule_for_method(method_upper, table_upper)
-                if tail == expected_last4:
-                    args2 = args[:-4] + replacement_tail
-                    rebuilt_lines = [f"      {a}," for a in args2[:-1]] + [f"      {args2[-1]}"]
-                    rebuilt = "\n" + "\n".join(rebuilt_lines) + "\n"
-                    out_mb2 = out_mb[:span[0] + 1] + rebuilt + out_mb[span[1]:]
-                    if out_mb2 != out_mb:
-                        out_mb = out_mb2
-                        changed = True
+                # Try last-5 first to cope with p_InvokeFromWR appended after the filter params.
+                if len(args) >= 5:
+                    tail5 = [a.strip().upper() for a in args[-5:]]
+                    if tail5 == expected_last4 + ["P_INVOKEFROMWR"]:
+                        new_args = args[:-5] + replacement_tail
+                # Try last-4 (no trailing p_InvokeFromWR).
+                if new_args is None:
+                    tail4 = [a.strip().upper() for a in args[-4:]]
+                    if tail4 == expected_last4:
+                        new_args = args[:-4] + replacement_tail
+
+            if new_args is not None and [a.strip() for a in new_args] != [a.strip() for a in args]:
+                rebuilt_lines = [f"      {a}," for a in new_args[:-1]] + [f"      {new_args[-1]}"]
+                rebuilt = "\n" + "\n".join(rebuilt_lines) + "\n"
+                out_mb2 = out_mb[:span[0] + 1] + rebuilt + out_mb[span[1]:]
+                if out_mb2 != out_mb:
+                    out_mb = out_mb2
+                    changed = True
 
     if not changed:
         return content, False
@@ -1471,6 +1632,19 @@ def apply_template_merge(out_path: Path, template_path: Path, nometabella: str, 
             if any((_param_name(p) or "") == "P_SEARCHPARAM" for p in merged_params):
                 _RESYNC_TABLES_WITH_SEARCHPARAM.add(nometabella.upper())
                 _capture_lsresync_me_params_for_table(Path(DEST_DIR), nometabella.upper())
+
+                # Override the param order with the complete merged order that already
+                # includes p_SearchParam (the disk-based capture reads the old file which
+                # had not yet been written with the SearchParam addition).
+                complete_order = [(_param_name(p) or "").upper() for p in merged_params if _param_name(p)]
+                _RESYNC_TABLE_GETSQL_PARAM_ORDER[nometabella.upper()] = complete_order
+
+                # Also capture p_ME_* params directly from merged_params as a fallback
+                # (in case the disk-based capture missed them).
+                me_from_merge = [p.strip() for p in merged_params
+                                 if (_param_name(p) or "").upper().startswith("P_ME_")]
+                if me_from_merge and nometabella.upper() not in _RESYNC_TABLE_ME_PARAMS:
+                    _RESYNC_TABLE_ME_PARAMS[nometabella.upper()] = me_from_merge
 
                 num_fields, _ = _build_wherecond_blocks_for_searchparam(nometabella)
                 _RESYNC_TABLE_NUMFIELDS[nometabella.upper()] = num_fields
@@ -1682,8 +1856,12 @@ def main():
                         t2, ch = _inject_me_params_after_anchor_in_signature_anykind(
                             t, "FUNCTION", nometabella.upper(), me_params, anchor_param_upper="P_SEARCHPARAM"
                         )
-                        if ch:
-                            write_text(out_path, t2, e)
+                        # Also inject into GetRow*/GetList*/GetRecord* declarations in pks.
+                        t3, ch2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
+                            t2, nometabella.upper(), me_params, kind="FUNCTION"
+                        )
+                        if ch or ch2:
+                            write_text(out_path, t3, e)
                     elif out_path.suffix.lower() == ".pkb":
                         t, e = read_text_best_effort(out_path)
                         t2, ch_sig = _inject_me_params_after_anchor_in_signature_anykind(
@@ -1692,8 +1870,12 @@ def main():
                         t3, ch_call = _inject_me_params_into_ls_search_call_getsql_lsresync(
                             t2, nometabella.upper(), me_params
                         )
-                        if ch_sig or ch_call:
-                            write_text(out_path, t3, e)
+                        # Also inject into GetRow*/GetList*/GetRecord* definitions in pkb.
+                        t4, ch_sig2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
+                            t3, nometabella.upper(), me_params, kind="FUNCTION"
+                        )
+                        if ch_sig or ch_call or ch_sig2:
+                            write_text(out_path, t4, e)
 
                 if prefix.upper() == "LSINT":
                     if out_path.suffix.lower() == ".pks":
@@ -1701,8 +1883,12 @@ def main():
                         t2, ch = _inject_me_params_after_anchor_in_signature_anykind(
                             t, "FUNCTION", nometabella.upper(), me_params, anchor_param_upper="P_SEARCHPARAM"
                         )
-                        if ch:
-                            write_text(out_path, t2, e)
+                        # Also inject into GetRow*/GetList*/GetRecord* declarations in pks.
+                        t3, ch2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
+                            t2, nometabella.upper(), me_params, kind="FUNCTION"
+                        )
+                        if ch or ch2:
+                            write_text(out_path, t3, e)
                     elif out_path.suffix.lower() == ".pkb":
                         t, e = read_text_best_effort(out_path)
                         t2, ch_sig = _inject_me_params_after_anchor_in_signature_anykind(
@@ -1711,8 +1897,12 @@ def main():
                         t3, ch_call = _inject_me_params_into_ls_search_call_after_searchparam_anykind(
                             t2, "FUNCTION", nometabella.upper(), me_params, callee_package_prefix="Ls"
                         )
-                        if ch_sig or ch_call:
-                            write_text(out_path, t3, e)
+                        # Also inject into GetRow*/GetList*/GetRecord* definitions in pkb.
+                        t4, ch_sig2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
+                            t3, nometabella.upper(), me_params, kind="FUNCTION"
+                        )
+                        if ch_sig or ch_call or ch_sig2:
+                            write_text(out_path, t4, e)
 
         # LsW: patch LS_SEARCH indipendente da LSRESYNC (solo in base a SEARCHOBJECTS)
         if prefix.upper() == "LSW":
