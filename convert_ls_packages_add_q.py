@@ -1182,7 +1182,19 @@ def _inject_me_params_into_ls_search_call_getsql_lsresync(text: str, table_upper
         if idx_context + 1 >= len(args):
             return text, False
 
-        tipo_sql_arg = args[idx_context + 1]
+        # Find the tipo_sql argument (e.g. SiwFunc.c_List / p_TipoSQL): it is the first
+        # arg after p_Context that is NOT itself a p_ME_* parameter.  When the source call
+        # is "out-of-standard" (p_ME_* appears right after p_Context, then SiwFunc.c_List),
+        # naively taking args[idx_context+1] would grab a p_ME_ value and then duplicate it.
+        tipo_sql_arg_idx = None
+        for _i in range(idx_context + 1, len(args)):
+            if args[_i].strip().upper() not in me_set_upper:
+                tipo_sql_arg_idx = _i
+                break
+        if tipo_sql_arg_idx is None:
+            return text, False
+
+        tipo_sql_arg = args[tipo_sql_arg_idx]
 
         me_in_sig_order: list[str] = []
         for pname in sig_order:
@@ -1192,7 +1204,12 @@ def _inject_me_params_into_ls_search_call_getsql_lsresync(text: str, table_upper
 
         prefix = args[: idx_context + 1]
         tail = args[idx_searchparam:]
+        # Remove any p_ME_* entries from the tail (they belong before tipo_sql_arg),
+        # then strip trailing NULL arguments that were present in the source but are
+        # no longer required in the _Q format.
         tail_filtered = [a for a in tail if a.strip().upper() not in me_set_upper]
+        while tail_filtered and tail_filtered[-1].strip().upper() == "NULL":
+            tail_filtered.pop()
 
         new_args = prefix + me_in_sig_order + [tipo_sql_arg] + tail_filtered
 
