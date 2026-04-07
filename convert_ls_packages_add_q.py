@@ -1578,7 +1578,10 @@ def _patch_ls_method_body_for_searchparam_call(content: str, table: str, method_
 
     decl_rx = re.compile(r"(?im)^([ \t]*v_SqlText[ \t]+VARCHAR2\s*\(\s*32767\s+CHAR\s*\)\s*;[ \t]*$)")
     decl_line = f"  v_SearchParam     {table_upper}_SEARCH_PARAM;"
-    if decl_line not in out_mb:
+    already_declared_rx = re.compile(
+        rf"(?im)^\s*v_SearchParam\s+{re.escape(table_upper)}_SEARCH_PARAM\s*;"
+    )
+    if not already_declared_rx.search(out_mb):
         m = decl_rx.search(out_mb)
         if m:
             out_mb2 = out_mb[:m.end()] + "\n" + decl_line + out_mb[m.end():]
