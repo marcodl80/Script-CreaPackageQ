@@ -300,7 +300,9 @@ def _find_outer_begin(text: str, after_pos: int) -> re.Match | None:
         r"|"
         r"(?:\bBEGIN\b)"
     )
-    begin_end_rx = re.compile(r"(?i)\bBEGIN\b|\bEND\b[ \t]*;")
+    begin_end_rx = re.compile(
+        r"(?i)\bBEGIN\b|\bEND\b(?:[ \t]*;|[ \t]+(?!(?:IF|LOOP|CASE)\b)[A-Z0-9_#$]+[ \t]*;)"
+    )
 
     pos = after_pos
     while True:
@@ -342,7 +344,9 @@ def extract_method_block_body(text: str, kind: str, name: str) -> str | None:
     if not begin_m:
         return None
 
-    token_rx = re.compile(r"(?i)\bBEGIN\b|\bEND\b[ \t]*;")
+    token_rx = re.compile(
+        r"(?i)\bBEGIN\b|\bEND\b(?:[ \t]*;|[ \t]+(?!(?:IF|LOOP|CASE)\b)[A-Z0-9_#$]+[ \t]*;)"
+    )
     depth = 0
     end_pos = None
     for tm in token_rx.finditer(text, pos=begin_m.start()):
@@ -559,7 +563,9 @@ def _slice_plsql_function_by_name(text: str, func_name_upper: str) -> tuple[int,
     if not begin_m:
         return None
 
-    token_rx = re.compile(r"(?i)\bBEGIN\b|\bEND\b[ \t]*;")
+    token_rx = re.compile(
+        r"(?i)\bBEGIN\b|\bEND\b(?:[ \t]*;|[ \t]+(?!(?:IF|LOOP|CASE)\b)[A-Z0-9_#$]+[ \t]*;)"
+    )
     depth = 0
     end_pos = None
     for tm in token_rx.finditer(text, pos=begin_m.start()):
