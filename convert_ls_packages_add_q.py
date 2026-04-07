@@ -1230,6 +1230,97 @@ def _inject_me_params_into_ls_search_call_getsql_lsresync(text: str, table_upper
     return out_text, (out_text != text)
 
 
+def _inject_me_params_into_getlist_getrecord_getrow_getsql_calls(
+    text: str, table_upper: str, me_params: list[str]
+) -> tuple[str, bool]:
+    """Inject missing p_ME_* args into LsResync*_Q.GetSql* calls inside GetList/GetRecord/GetRow bodies.
+
+    After _patch_ls_pkb_getsql_calls_for_table rebuilds the GetSql call args, the call may
+    still be missing p_ME_* parameters (e.g. when the source already uses v_SearchParam and
+    lacks the old-style trailing filter params that the signature-based fallback relies on).
+    This function inserts any missing p_ME_* params right after p_Context in the call args,
+    using the known _RESYNC_TABLE_GETSQL_PARAM_ORDER signature to determine which params
+    are needed and in what order.
+    """
+    sig_order = _RESYNC_TABLE_GETSQL_PARAM_ORDER.get(table_upper, [])
+    if not sig_order:
+        return text, False
+
+    me_arg_names: list[str] = []
+    for p in me_params:
+        mm = re.match(r"(?is)^\s*([A-Za-z0-9_#$]+)\b", p.strip())
+        if mm:
+            me_arg_names.append(mm.group(1))
+    if not me_arg_names:
+        return text, False
+
+    me_arg_names_upper = [x.upper() for x in me_arg_names]
+    me_set_upper = set(me_arg_names_upper)
+
+    # Collect p_ME_* names in the order they appear in the GetSql signature.
+    me_in_sig_order: list[str] = []
+    for pname in sig_order:
+        if pname.startswith("P_ME_") and pname in me_set_upper:
+            ix = me_arg_names_upper.index(pname)
+            me_in_sig_order.append(me_arg_names[ix])
+
+    if not me_in_sig_order:
+        return text, False
+
+    changed_any = False
+    out_text = text
+    for method_suffix in ("GETLIST", "GETRECORD", "GETROW"):
+        method_upper = f"{method_suffix}{table_upper}"
+        mb = extract_method_block_body(out_text, "FUNCTION", method_upper)
+        if not mb:
+            continue
+
+        call_rx = re.compile(
+            rf"(?is)(LSRESYNC{re.escape(table_upper)}_Q\s*\.\s*GetSql{re.escape(table_upper)}\s*\()"
+        )
+        cm = call_rx.search(mb)
+        if not cm:
+            continue
+
+        open_idx = cm.end() - 1
+        span = _find_matching_paren_span(mb, open_idx)
+        if not span:
+            continue
+
+        inside = mb[span[0] + 1:span[1]]
+        args = _split_params(inside)
+        if not args:
+            continue
+
+        # Check which p_ME_* params are missing from the call args.
+        args_upper_set = {a.strip().upper() for a in args}
+        missing_me = [m for m in me_in_sig_order if m.upper() not in args_upper_set]
+        if not missing_me:
+            continue  # All p_ME_* params are already present.
+
+        # Find p_Context in args.
+        idx_context = next((i for i, a in enumerate(args) if a.strip().upper() == "P_CONTEXT"), None)
+        if idx_context is None:
+            continue
+
+        # Insert the missing p_ME_* params right after p_Context.
+        new_args = args[:idx_context + 1] + missing_me + args[idx_context + 1:]
+
+        if [a.strip() for a in new_args] == [a.strip() for a in args]:
+            continue
+
+        rebuilt_lines = [f"      {a}," for a in new_args[:-1]] + [f"      {new_args[-1]}"]
+        rebuilt = "\n" + "\n".join(rebuilt_lines) + "\n"
+        out_mb = mb[:span[0] + 1] + rebuilt + mb[span[1]:]
+
+        out_text2 = out_text.replace(mb, out_mb)
+        if out_text2 != out_text:
+            out_text = out_text2
+            changed_any = True
+
+    return out_text, changed_any
+
+
 def patch_lsw_pkb_searchparam_constructor_null_list(text: str, table_upper: str) -> tuple[str, int]:
     n, null_list = _null_list_for_searchparam(table_upper)
     if n <= 0 or not null_list.strip():
@@ -1920,12 +2011,16 @@ def main():
                         t3, ch_call = _inject_me_params_into_ls_search_call_getsql_lsresync(
                             t2, nometabella.upper(), me_params
                         )
-                        # Also inject into GetRow*/GetList*/GetRecord* definitions in pkb.
-                        t4, ch_sig2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
-                            t3, nometabella.upper(), me_params, kind="FUNCTION"
+                        # Inject p_ME_* into GetList/GetRecord/GetRow body GetSql calls.
+                        t4, ch_getlist_calls = _inject_me_params_into_getlist_getrecord_getrow_getsql_calls(
+                            t3, nometabella.upper(), me_params
                         )
-                        if ch_sig or ch_call or ch_sig2:
-                            write_text(out_path, t4, e)
+                        # Also inject into GetRow*/GetList*/GetRecord* definitions in pkb.
+                        t5, ch_sig2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
+                            t4, nometabella.upper(), me_params, kind="FUNCTION"
+                        )
+                        if ch_sig or ch_call or ch_getlist_calls or ch_sig2:
+                            write_text(out_path, t5, e)
 
                 if prefix.upper() == "LSINT":
                     if out_path.suffix.lower() == ".pks":
