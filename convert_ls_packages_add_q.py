@@ -1500,6 +1500,24 @@ def _patch_ls_method_body_for_searchparam_call(content: str, table: str, method_
                 if out_mb2 != out_mb:
                     out_mb = out_mb2
                     changed = True
+    else:
+        # v_SearchParam.pFilter is already present (copied verbatim from source).
+        # The TABLE_SEARCH_PARAM constructor may still have the wrong number of NULLs
+        # (e.g. source had 4 NULLs while SEARCHOBJECTS requires 15).  Fix the arity now.
+        nfields_ctor, null_list_ctor = _null_list_for_searchparam(table)
+        if nfields_ctor > 0:
+            ctor_rx = re.compile(
+                rf"(?i)\b{re.escape(table_upper)}_SEARCH_PARAM\s*\(\s*((?:NULL\s*,\s*)*NULL)\s*\)"
+            )
+            cm_ctor = ctor_rx.search(out_mb)
+            if cm_ctor:
+                existing_null_count = len(re.findall(r"(?i)\bNULL\b", cm_ctor.group(1)))
+                if existing_null_count != nfields_ctor:
+                    corrected_ctor = f"{table_upper}_SEARCH_PARAM( {null_list_ctor})"
+                    out_mb2 = out_mb[:cm_ctor.start()] + corrected_ctor + out_mb[cm_ctor.end():]
+                    if out_mb2 != out_mb:
+                        out_mb = out_mb2
+                        changed = True
 
     call_rx = re.compile(rf"(?is)(LSRESYNC{re.escape(table_upper)}_Q\s*\.\s*GetSql{re.escape(table_upper)}\s*\()")
     cm = call_rx.search(out_mb)
