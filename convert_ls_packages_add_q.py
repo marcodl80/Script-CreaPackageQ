@@ -1230,6 +1230,119 @@ def _inject_me_params_into_ls_search_call_getsql_lsresync(text: str, table_upper
     return out_text, (out_text != text)
 
 
+def _inject_me_params_into_getlist_getrecord_getrow_getsql_calls(
+    text: str, table_upper: str, me_params: list[str]
+) -> tuple[str, bool]:
+    """Ensure p_ME_* args are present in the LsResync*_Q.GetSql* calls
+    inside GetList*, GetRecord*, GetRow* methods.
+
+    After _patch_ls_pkb_getsql_calls_for_table has rebuilt the call
+    (NULL → v_SearchParam, trailing filter params removed), the p_ME_*
+    params may still be absent when the signature-based rebuild could not
+    determine their positions.  This pass inserts them after p_Context
+    and before the tipo-sql argument (e.g. SiwFunc.c_List), relying on
+    the fact that v_SearchParam is already present as the anchor.
+
+    The function is idempotent: if all expected p_ME_* are already
+    present in the call it leaves the call unchanged.
+    """
+    sig_order = _RESYNC_TABLE_GETSQL_PARAM_ORDER.get(table_upper, [])
+    if not sig_order:
+        return text, False
+
+    me_arg_names: list[str] = []
+    for p in me_params:
+        mm = re.match(r"(?is)^\s*([A-Za-z0-9_#$]+)", p.strip())
+        if mm:
+            me_arg_names.append(mm.group(1))
+    if not me_arg_names:
+        return text, False
+
+    me_arg_names_upper = [a.upper() for a in me_arg_names]
+    me_set_upper = set(me_arg_names_upper)
+
+    # Ordered list of p_ME_* names as they appear in the GetSql _Q signature.
+    me_in_sig_order: list[str] = []
+    for pname in sig_order:
+        if pname.startswith("P_ME_") and pname in me_set_upper:
+            ix = me_arg_names_upper.index(pname)
+            me_in_sig_order.append(me_arg_names[ix])
+    if not me_in_sig_order:
+        return text, False
+
+    call_rx = re.compile(
+        rf"(?is)(LSRESYNC{re.escape(table_upper)}_Q\s*\.\s*GetSql{re.escape(table_upper)}\s*\()"
+    )
+
+    changed = False
+    for method_name in (
+        f"GETLIST{table_upper}",
+        f"GETRECORD{table_upper}",
+        f"GETROW{table_upper}",
+    ):
+        mb = extract_method_block_body(text, "FUNCTION", method_name)
+        if not mb:
+            continue
+
+        out_mb = mb
+        cm = call_rx.search(out_mb)
+        if not cm:
+            continue
+
+        span = _find_matching_paren_span(out_mb, cm.end() - 1)
+        if not span:
+            continue
+
+        inside = out_mb[span[0] + 1 : span[1]]
+        args = _split_params(inside)
+        if not args:
+            continue
+
+        # If all expected p_ME_* are already present, nothing to do.
+        args_upper = [a.strip().upper() for a in args]
+        if all(me.upper() in args_upper for me in me_in_sig_order):
+            continue
+
+        # Locate p_Context.
+        idx_context = next(
+            (i for i, a in enumerate(args) if a.strip().upper() == "P_CONTEXT"), None
+        )
+        if idx_context is None:
+            continue
+
+        # Locate v_SearchParam (must be present after _patch_ls_pkb_getsql_calls_for_table).
+        idx_vsearchparam = next(
+            (
+                i
+                for i, a in enumerate(args)
+                if a.strip().upper() in ("V_SEARCHPARAM", "P_SEARCHPARAM")
+            ),
+            None,
+        )
+        # Need at least one arg between p_Context and v_SearchParam (the tipo-sql arg).
+        if idx_vsearchparam is None or idx_vsearchparam <= idx_context + 1:
+            continue
+
+        # The tipo-sql arg (e.g. SiwFunc.c_List) is the arg immediately before
+        # v_SearchParam.  Everything from v_SearchParam onwards is kept as the tail.
+        tipo_sql_arg = args[idx_vsearchparam - 1]
+        prefix = args[: idx_context + 1]
+        tail_from_vsearchparam = args[idx_vsearchparam:]
+
+        new_args = prefix + me_in_sig_order + [tipo_sql_arg] + tail_from_vsearchparam
+
+        if [a.strip() for a in new_args] == [a.strip() for a in args]:
+            continue
+
+        rebuilt_lines = [f"      {a}," for a in new_args[:-1]] + [f"      {new_args[-1]}"]
+        rebuilt = "\n" + "\n".join(rebuilt_lines) + "\n"
+        out_mb2 = out_mb[: span[0] + 1] + rebuilt + out_mb[span[1]:]
+        text = text.replace(mb, out_mb2)
+        changed = True
+
+    return text, changed
+
+
 def patch_lsw_pkb_searchparam_constructor_null_list(text: str, table_upper: str) -> tuple[str, int]:
     n, null_list = _null_list_for_searchparam(table_upper)
     if n <= 0 or not null_list.strip():
@@ -1920,11 +2033,15 @@ def main():
                         t3, ch_call = _inject_me_params_into_ls_search_call_getsql_lsresync(
                             t2, nometabella.upper(), me_params
                         )
+                        # Inject p_ME_* into GetSql calls inside GetList/GetRecord/GetRow.
+                        t3b, ch_call2 = _inject_me_params_into_getlist_getrecord_getrow_getsql_calls(
+                            t3, nometabella.upper(), me_params
+                        )
                         # Also inject into GetRow*/GetList*/GetRecord* definitions in pkb.
                         t4, ch_sig2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
-                            t3, nometabella.upper(), me_params, kind="FUNCTION"
+                            t3b, nometabella.upper(), me_params, kind="FUNCTION"
                         )
-                        if ch_sig or ch_call or ch_sig2:
+                        if ch_sig or ch_call or ch_call2 or ch_sig2:
                             write_text(out_path, t4, e)
 
                 if prefix.upper() == "LSINT":
