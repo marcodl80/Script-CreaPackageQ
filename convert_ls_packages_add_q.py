@@ -96,7 +96,7 @@ def _find_method_header_pos(text: str, kind: str, name: str) -> re.Match | None:
 
 
 def _find_signature_paren_index(text: str, kind: str, name: str) -> int:
-    rx = re.compile(rf"(?is){re.escape(kind)}\s+{re.escape(name)}\s*\(")
+    rx = re.compile(rf"(?is){re.escape(kind)}\s+{re.escape(name)}\b\s*\(")
     m = rx.search(text)
     if not m:
         return -1
@@ -1628,26 +1628,35 @@ def apply_template_merge(out_path: Path, template_path: Path, nometabella: str, 
                 merged_params=merged_params,
             )
 
-        if prefix.upper() == "LSRESYNC" and kind.upper() == "FUNCTION" and lsresync_rule_applied:
-            if any((_param_name(p) or "") == "P_SEARCHPARAM" for p in merged_params):
-                _RESYNC_TABLES_WITH_SEARCHPARAM.add(nometabella.upper())
-                _capture_lsresync_me_params_for_table(Path(DEST_DIR), nometabella.upper())
+        # Capture global state whenever GetSql{TABLE} ends up with P_SEARCHPARAM in its
+        # signature – regardless of whether the param was just added by the rule above
+        # (lsresync_rule_applied=True) or was already present in the source file
+        # (lsresync_rule_applied=False, e.g. LsResyncSIART136 where GetSqlSIART136
+        # already declares p_SearchParam and p_ME_* before conversion).
+        if (
+            prefix.upper() == "LSRESYNC"
+            and kind.upper() == "FUNCTION"
+            and resolved_name.upper() == f"GETSQL{nometabella.upper()}"
+            and any((_param_name(p) or "") == "P_SEARCHPARAM" for p in merged_params)
+        ):
+            _RESYNC_TABLES_WITH_SEARCHPARAM.add(nometabella.upper())
+            _capture_lsresync_me_params_for_table(Path(DEST_DIR), nometabella.upper())
 
-                # Override the param order with the complete merged order that already
-                # includes p_SearchParam (the disk-based capture reads the old file which
-                # had not yet been written with the SearchParam addition).
-                complete_order = [(_param_name(p) or "").upper() for p in merged_params if _param_name(p)]
-                _RESYNC_TABLE_GETSQL_PARAM_ORDER[nometabella.upper()] = complete_order
+            # Override the param order with the complete merged order that already
+            # includes p_SearchParam (the disk-based capture reads the old file which
+            # had not yet been written with the SearchParam addition).
+            complete_order = [(_param_name(p) or "").upper() for p in merged_params if _param_name(p)]
+            _RESYNC_TABLE_GETSQL_PARAM_ORDER[nometabella.upper()] = complete_order
 
-                # Also capture p_ME_* params directly from merged_params as a fallback
-                # (in case the disk-based capture missed them).
-                me_from_merge = [p.strip() for p in merged_params
-                                 if (_param_name(p) or "").upper().startswith("P_ME_")]
-                if me_from_merge and nometabella.upper() not in _RESYNC_TABLE_ME_PARAMS:
-                    _RESYNC_TABLE_ME_PARAMS[nometabella.upper()] = me_from_merge
+            # Also capture p_ME_* params directly from merged_params as a fallback
+            # (in case the disk-based capture missed them).
+            me_from_merge = [p.strip() for p in merged_params
+                             if (_param_name(p) or "").upper().startswith("P_ME_")]
+            if me_from_merge and nometabella.upper() not in _RESYNC_TABLE_ME_PARAMS:
+                _RESYNC_TABLE_ME_PARAMS[nometabella.upper()] = me_from_merge
 
-                num_fields, _ = _build_wherecond_blocks_for_searchparam(nometabella)
-                _RESYNC_TABLE_NUMFIELDS[nometabella.upper()] = num_fields
+            num_fields, _ = _build_wherecond_blocks_for_searchparam(nometabella)
+            _RESYNC_TABLE_NUMFIELDS[nometabella.upper()] = num_fields
 
         if [p.strip() for p in merged_params] != [p.strip() for p in out_params_before]:
             indent = "  "
