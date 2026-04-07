@@ -1257,7 +1257,7 @@ def _inject_me_params_into_getlist_getrecord_getrow_getsql_calls(
     # Build me_arg_names / me_set_upper from me_params.
     me_arg_names: list[str] = []
     for p in me_params:
-        mm = re.match(r"(?is)^\s*([A-Z0-9_#$]+)", p.strip())
+        mm = re.match(r"(?s)^\s*([A-Za-z0-9_#$]+)", p.strip())
         if mm:
             me_arg_names.append(mm.group(1))
     me_arg_names_upper = [x.upper() for x in me_arg_names]
