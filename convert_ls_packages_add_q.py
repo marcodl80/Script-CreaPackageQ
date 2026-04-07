@@ -1230,6 +1230,129 @@ def _inject_me_params_into_ls_search_call_getsql_lsresync(text: str, table_upper
     return out_text, (out_text != text)
 
 
+def _inject_me_params_into_getlist_getrecord_getrow_getsql_calls(
+    text: str,
+    table_upper: str,
+    me_params: list[str],
+) -> tuple[str, bool]:
+    """Ensure p_ME_* params from the LsResync*_Q.GetSql* signature are present in the
+    call to that function inside GetList*/GetRecord*/GetRow* method bodies.
+
+    This is the counterpart of _inject_me_params_into_ls_search_call_getsql_lsresync for
+    the three remaining LS methods.  It is idempotent: if the p_ME_* params are already
+    in the call it does nothing.
+
+    Handles two situations:
+      1. The call is already in new-style format (has v_SearchParam) but is missing the
+         p_ME_* param – inject it after p_Context, before the TipoSQL argument.
+      2. The call went through the last-N fallback and still has a stray NULL at the
+         p_ME_* position plus a second stray NULL at the old P_SEARCHPARAM position –
+         inject the p_ME_* name and discard both stray NULLs by reconstructing the arg
+         list.
+    """
+    sig_order = _RESYNC_TABLE_GETSQL_PARAM_ORDER.get(table_upper, [])
+    if not sig_order:
+        return text, False
+
+    # Build me_arg_names / me_set_upper from me_params.
+    me_arg_names: list[str] = []
+    for p in me_params:
+        mm = re.match(r"(?s)^\s*([A-Za-z0-9_#$]+)", p.strip())
+        if mm:
+            me_arg_names.append(mm.group(1))
+    me_arg_names_upper = [x.upper() for x in me_arg_names]
+    me_set_upper = set(me_arg_names_upper)
+
+    # Ordered list of p_ME_* names as they appear in the GetSql signature.
+    me_in_sig_order: list[str] = []
+    for pname in sig_order:
+        if pname.startswith("P_ME_") and pname in me_set_upper:
+            ix = me_arg_names_upper.index(pname)
+            me_in_sig_order.append(me_arg_names[ix])
+
+    if not me_in_sig_order:
+        return text, False
+
+    changed = False
+    call_rx = re.compile(
+        rf"(?is)(LSRESYNC{re.escape(table_upper)}_Q\s*\.\s*GetSql{re.escape(table_upper)}\s*\()"
+    )
+
+    for method_name in (
+        f"GETLIST{table_upper}",
+        f"GETRECORD{table_upper}",
+        f"GETROW{table_upper}",
+    ):
+        mb = extract_method_block_body(text, "FUNCTION", method_name)
+        if not mb:
+            continue
+
+        out_mb = mb
+        cm = call_rx.search(out_mb)
+        if not cm:
+            continue
+
+        span = _find_matching_paren_span(out_mb, cm.end() - 1)
+        if not span:
+            continue
+
+        inside = out_mb[span[0] + 1 : span[1]]
+        args = _split_params(inside)
+        if not args:
+            continue
+
+        # Determine which p_ME_* params are missing from the call.
+        existing_upper = {a.strip().upper() for a in args}
+        to_add = [a for a in me_in_sig_order if a.upper() not in existing_upper]
+        if not to_add:
+            continue  # already correct
+
+        # The call must already be in new-style (has v_SearchParam / p_SearchParam)
+        # for us to safely inject.  If it is still old-style, skip – the earlier
+        # _patch_ls_pkb_getsql_calls_for_table step should have handled it.
+        idx_sp = _find_searchparam_arg_index(args)
+        if idx_sp is None:
+            continue
+
+        idx_context = next(
+            (i for i, a in enumerate(args) if a.strip().upper() == "P_CONTEXT"), None
+        )
+        if idx_context is None:
+            continue
+
+        # Find the TipoSQL argument: first arg after p_Context that is neither a
+        # p_ME_* param nor a stray NULL (stray NULLs appear at the position where
+        # p_ME_* should have gone when the last-N fallback was used).
+        tipo_sql_idx = None
+        for _i in range(idx_context + 1, idx_sp):
+            a_upper = args[_i].strip().upper()
+            if a_upper not in me_set_upper and a_upper != "NULL":
+                tipo_sql_idx = _i
+                break
+        if tipo_sql_idx is None:
+            continue
+        tipo_sql = args[tipo_sql_idx]
+
+        # Reconstruct: prefix (up to p_Context) + missing p_ME_* + TipoSQL + tail
+        # (from v_SearchParam onwards, stripping any leftover p_ME_* from the tail).
+        prefix_part = args[: idx_context + 1]
+        tail = args[idx_sp:]
+        tail_filtered = [a for a in tail if a.strip().upper() not in me_set_upper]
+
+        new_args = prefix_part + to_add + [tipo_sql] + tail_filtered
+
+        if [a.strip() for a in new_args] == [a.strip() for a in args]:
+            continue
+
+        rebuilt_lines = [f"      {a}," for a in new_args[:-1]] + [f"      {new_args[-1]}"]
+        rebuilt = "\n" + "\n".join(rebuilt_lines) + "\n"
+        out_mb2 = out_mb[: span[0] + 1] + rebuilt + out_mb[span[1] :]
+        text = text.replace(mb, out_mb2)
+        changed = True
+
+    return text, changed
+
+
 def patch_lsw_pkb_searchparam_constructor_null_list(text: str, table_upper: str) -> tuple[str, int]:
     n, null_list = _null_list_for_searchparam(table_upper)
     if n <= 0 or not null_list.strip():
@@ -1924,8 +2047,12 @@ def main():
                         t4, ch_sig2 = _inject_me_params_into_getrow_getrecord_getlist_signatures(
                             t3, nometabella.upper(), me_params, kind="FUNCTION"
                         )
-                        if ch_sig or ch_call or ch_sig2:
-                            write_text(out_path, t4, e)
+                        # Inject p_ME_* into the GetSql calls inside GetList*/GetRecord*/GetRow* bodies.
+                        t5, ch_call2 = _inject_me_params_into_getlist_getrecord_getrow_getsql_calls(
+                            t4, nometabella.upper(), me_params
+                        )
+                        if ch_sig or ch_call or ch_sig2 or ch_call2:
+                            write_text(out_path, t5, e)
 
                 if prefix.upper() == "LSINT":
                     if out_path.suffix.lower() == ".pks":
